@@ -3,8 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import json
 import logging
-from groq import Groq
 import os
+import requests
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -25,22 +25,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Groq client lazily
-client = None
-
-def get_groq_client():
-    global client
-    if client is None:
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="GROQ_API_KEY environment variable not set")
-        try:
-            client = Groq(api_key=api_key)
-        except TypeError:
-            # Fallback for older Groq versions
-            import groq
-            client = groq.Client(api_key=api_key)
-    return client
+def call_groq_api(prompt: str):
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY environment variable not set")
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "messages": [{"role": "user", "content": prompt}],
+        "model": "llama-3.1-8b-instant",
+        "temperature": 0.3,
+        "max_tokens": 1000
+    }
+    
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers=headers,
+        json=data
+    )
+    
+    if response.status_code != 200:
+        raise Exception(f"Groq API error: {response.status_code} - {response.text}")
+    
+    return response.json()["choices"][0]["message"]["content"]
 
 class JobApplicationRequest(BaseModel):
     resume_text: str
@@ -50,37 +61,38 @@ class JobApplicationRequest(BaseModel):
 async def tailor_application(request: JobApplicationRequest):
     try:
         prompt = f"""
-You are an expert career coach. Analyze the resume and job description, then return a JSON response with exactly these keys:
+Analyze this resume and job description, then return ONLY a valid JSON object with no additional text or formatting:
 
-RESUME:
-{request.resume_text}
+RESUME: {request.resume_text}
 
-JOB DESCRIPTION:
-{request.job_description}
+JOB DESCRIPTION: {request.job_description}
 
-Return JSON with:
-- "resume_bullets": array of 5-7 tailored bullet points that match the job requirements
-- "cover_letter": string under 200 words highlighting key matches
-- "skills": array of top 5 skills/keywords to emphasize from the job description
-- "match_score": integer from 0-100 representing how well the resume matches the job
+Return this exact JSON structure:
+{{
+  "resume_bullets": ["bullet1", "bullet2", "bullet3", "bullet4", "bullet5"],
+  "cover_letter": "short cover letter under 200 words",
+  "skills": ["skill1", "skill2", "skill3", "skill4", "skill5"],
+  "match_score": 85
+}}
 
-Respond with valid JSON only, no additional text.
+Respond with ONLY the JSON object, no markdown, no explanations.
 """
 
-        groq_client = get_groq_client()
-        response = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama3-8b-8192",
-            temperature=0.3,
-            max_tokens=1000
-        )
+        response_content = call_groq_api(prompt)
+        logger.info(f"AI Response: {response_content}")
         
-        result = json.loads(response.choices[0].message.content)
+        # Try to extract JSON if wrapped in markdown
+        if "```json" in response_content:
+            response_content = response_content.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_content:
+            response_content = response_content.split("```")[1].split("```")[0].strip()
+        
+        result = json.loads(response_content)
         logger.info(f"Successfully processed application tailoring")
         return result
         
-    except json.JSONDecodeError:
-        logger.error("Failed to parse JSON response from AI model")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON response: {response_content[:200]}...")
         return {"error": "Failed to generate structured response"}
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
